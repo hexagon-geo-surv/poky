@@ -306,6 +306,9 @@ class RecipeModified:
         self.topdir = None
         self.workdir = None
         self.recipe_id = None
+        # recipe variables from d.getVarFlags
+        self.f_do_install_cleandirs = None
+        self.f_do_install_dirs = None
         # replicate bitbake build environment
         self.exported_vars = None
         self.cmd_compile = None
@@ -373,6 +376,11 @@ class RecipeModified:
         self.target_dbgsrc_dir = recipe_d.getVar('TARGET_DBGSRC_DIR')
         self.topdir = recipe_d.getVar('TOPDIR')
         self.workdir = os.path.realpath(recipe_d.getVar('WORKDIR'))
+
+        self.f_do_install_cleandirs = recipe_d.getVarFlag(
+            'do_install', 'cleandirs').split()
+        self.f_do_install_dirs = recipe_d.getVarFlag(
+            'do_install', 'dirs').split()
 
         self.__init_exported_variables(recipe_d)
 
@@ -675,6 +683,63 @@ class RecipeModified:
                     binaries.append(abs_name[d_len:])
         return sorted(binaries)
 
+    def gen_fakeroot_install_script(self):
+        """Generate a helper script to execute make install with pseudo
+
+        For the deployment to the target device the do_install task must be
+        executed out of the IDE as well. This function generates a script which
+        runs the run.do_install script from bitbake under pseudo so that it picks
+        up the appropriate file permissions. Generating a self-contained script
+        is much quicker than calling bitbake or devtool build from an IDE.
+        This also avoids that bitbake is calling other tasks which might interfere
+        with the users goals.
+        """
+        cmd_lines = ['#!/bin/sh']
+
+        # Ensure the do compile step gets always executed without pseudo before do install
+        if self.cmd_compile:
+            cmd_compile = "( cd %s && %s)" % (
+                self.real_srctree, self.cmd_compile)
+            cmd_lines.append(cmd_compile)
+
+        # Check run.do_install script is available
+        if not os.access(self.fakerootcmd, os.X_OK):
+            raise DevtoolError(
+                "pseudo executable %s could not be found" % self.fakerootcmd)
+        run_do_install = os.path.join(self.workdir, 'temp', 'run.do_install')
+        if not os.access(run_do_install, os.X_OK):
+            raise DevtoolError(
+                "run script does not exists: %s" % run_do_install)
+
+        # Set up the appropriate environment
+        newenv = dict(os.environ)
+        for varvalue in self.fakerootenv.split():
+            if '=' in varvalue:
+                splitval = varvalue.split('=', 1)
+                newenv[splitval[0]] = splitval[1]
+
+        # Replicate the environment variables from bitbake
+        for var, val in newenv.items():
+            if not RecipeModified.is_valid_shell_variable(var):
+                continue
+            cmd_lines.append('%s="%s"' % (var, val))
+            cmd_lines.append('export %s' % var)
+
+        # Setup the task environment as bitbake would do it based on the varFlags
+        for d in self.f_do_install_cleandirs:
+            cmd_lines.append('%s rm -rf %s' % (self.fakerootcmd, d))
+        for d in self.f_do_install_dirs:
+            cmd_lines.append('%s mkdir -p %s' % (self.fakerootcmd, d))
+        if len(self.f_do_install_dirs) > 0:
+            cmd = "cd %s" % self.f_do_install_dirs[-1]
+            cmd_lines.append('%s || { "%s failed"; exit 1; }' % (cmd, cmd))
+
+        # Finally call run.do_install on pseudo
+        cmd = "%s %s" % (self.fakerootcmd, run_do_install)
+        cmd_lines.append('%s || { echo "%s failed"; exit 1; }' % (cmd, cmd))
+
+        return self.write_script(cmd_lines, 'bb_run_do_install')
+
     def gen_deploy_target_script(self, args):
         """Generate a script which does what devtool deploy-target does
 
@@ -710,22 +775,9 @@ class RecipeModified:
 
     def gen_install_deploy_script(self, args):
         """Generate a script which does install and deploy"""
-        cmd_lines = ['#!/bin/bash']
-
-        # . oe-init-build-env $BUILDDIR
-        # Note: Sourcing scripts with arguments requires bash
-        cmd_lines.append('cd "%s" || { echo "cd %s failed"; exit 1; }' % (
-            self.oe_init_dir, self.oe_init_dir))
-        cmd_lines.append('. "%s" "%s" || { echo ". %s %s failed"; exit 1; }' % (
-            self.oe_init_build_env, self.topdir, self.oe_init_build_env, self.topdir))
-
-        # bitbake -c install
-        cmd_lines.append(
-            'bitbake %s -c install --force || { echo "bitbake %s -c install --force failed"; exit 1; }' % (self.bpn, self.bpn))
-
-        # Self contained devtool deploy-target
+        cmd_lines = ['#!/bin/sh -e']
+        cmd_lines.append(self.gen_fakeroot_install_script())
         cmd_lines.append(self.gen_deploy_target_script(args))
-
         return self.write_script(cmd_lines, 'install_and_deploy')
 
     def write_script(self, cmd_lines, script_name):
